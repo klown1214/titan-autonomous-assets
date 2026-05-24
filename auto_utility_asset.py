@@ -1,204 +1,289 @@
-import re
+import csv
 import json
 import sys
 import os
-import datetime
+import io
+from datetime import datetime
 
-# --- Configuration (can be modified by user or external script) ---
-# Default log file path for processing (if arguments are provided)
-DEFAULT_INPUT_FILE = "input.log"
-# Default output JSON file path (if arguments are provided)
-DEFAULT_OUTPUT_FILE = "output.json"
-# Default regex pattern for parsing log lines (can be customized)
-# This pattern captures: [Timestamp] LEVEL: Message
-DEFAULT_REGEX_PATTERN = r"^\[(.*?)\] (.*?): (.*)$"
-# Default group names to assign to the captured regex groups
-DEFAULT_GROUP_NAMES = ["timestamp", "level", "message"]
+# --- Configuration for logging ---
+LOG_FILE_NAME = "csv_to_json_utility.log"
 
-# --- Utility Functions ---
-
-def _log_error(message, e=None):
-    """Logs an error message to stderr and a local error log file."""
-    error_time = datetime.datetime.now().isoformat()
-    error_message = f"[{error_time}] ERROR: {message}"
-    if e:
-        error_message += f" - Exception: {type(e).__name__}: {e}"
-
-    # Log to stderr for immediate feedback
-    print(error_message, file=sys.stderr)
-
-    # Optionally, log to a local error file
-    try:
-        with open("log_parser_errors.log", "a", encoding="utf-8") as f:
-            f.write(error_message + "\n")
-    except Exception as file_e:
-        print(f"[{error_time}] CRITICAL ERROR: Could not write to error log file: {file_e}", file=sys.stderr)
-
-def parse_text_with_regex(text_content, regex_pattern, group_names=None):
+def _log_message(level, message, error_details=None):
     """
-    Parses a given text content using a regular expression pattern.
+    Internal helper to log messages to stderr and a local log file.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] [{level.upper()}] {message}"
+    if error_details:
+        log_entry += f" - Details: {error_details}"
+
+    print(log_entry, file=sys.stderr)
+
+    try:
+        with open(LOG_FILE_NAME, 'a', encoding='utf-8') as f:
+            f.write(log_entry + '\n')
+    except Exception as e:
+        print(f"[{timestamp}] [ERROR] Failed to write to log file '{LOG_FILE_NAME}': {e}", file=sys.stderr)
+
+def csv_to_json(csv_source, input_type='path', output_file_path=None, delimiter=','):
+    """
+    Converts CSV data to JSON.
 
     Args:
-        text_content (str): The multi-line string content to parse.
-        regex_pattern (str): The regular expression pattern with capture groups.
-        group_names (list, optional): A list of names for the captured groups.
-                                      If None or mismatched, default names (group_1, group_2, ...) are used.
+        csv_source (str): The source of the CSV data. Can be a file path or a CSV string.
+        input_type (str): 'path' if csv_source is a file path, 'string' if csv_source is a CSV string.
+                          Defaults to 'path'.
+        output_file_path (str, optional): The path to the output JSON file. If None, the JSON
+                                         string is returned and not saved to a file.
+        delimiter (str): The delimiter used in the CSV data. Defaults to ','.
 
     Returns:
-        list: A list of dictionaries, where each dictionary represents a parsed line
-              and its keys correspond to group_names or default names.
-              Returns an empty list on parsing failure or no matches.
+        str or None: The JSON string if output_file_path is None, otherwise None.
+                     Returns None if an error occurs.
     """
-    parsed_data = []
+    json_data = []
+    
     try:
-        compiled_regex = re.compile(regex_pattern)
-        for line_num, line in enumerate(text_content.splitlines()):
-            if not line.strip(): # Skip empty lines
-                continue
-            match = compiled_regex.match(line.strip())
-            if match:
-                record = {}
-                # Check if group_names are provided and match the number of captured groups
-                if group_names and len(group_names) == len(match.groups()):
-                    for i, name in enumerate(group_names):
-                        record[name] = match.group(i + 1)
-                else:
-                    # Fallback to generic names if group_names not provided or mismatched
-                    for i, group_val in enumerate(match.groups()):
-                        record[f"group_{i + 1}"] = group_val
-                parsed_data.append(record)
-    except re.error as e:
-        _log_error(f"Invalid regex pattern provided: '{regex_pattern}'", e)
-        return []
+        if input_type == 'path':
+            if not os.path.exists(csv_source):
+                _log_message("error", f"Input CSV file not found: '{csv_source}'")
+                return None
+            try:
+                with open(csv_source, 'r', newline='', encoding='utf-8') as csvfile:
+                    reader = csv.DictReader(csvfile, delimiter=delimiter)
+                    for row in reader:
+                        json_data.append(row)
+            except Exception as e:
+                _log_message("error", f"Failed to read or parse CSV file '{csv_source}'", str(e))
+                return None
+        elif input_type == 'string':
+            csv_file_like = io.StringIO(csv_source)
+            reader = csv.DictReader(csv_file_like, delimiter=delimiter)
+            for row in reader:
+                json_data.append(row)
+        else:
+            _log_message("error", f"Invalid input_type '{input_type}'. Must be 'path' or 'string'.")
+            return None
+
+    except csv.Error as e:
+        _log_message("error", "CSV parsing error", str(e))
+        return None
     except Exception as e:
-        _log_error(f"An unexpected error occurred during regex parsing of text content.", e)
-        return []
-    return parsed_data
-
-def process_file_to_json(input_filepath, output_filepath, regex_pattern, group_names=None):
-    """
-    Reads a file, parses its content using a regex, and saves the structured data as JSON.
-
-    Args:
-        input_filepath (str): Path to the input text file.
-        output_filepath (str): Path to save the output JSON file.
-        regex_pattern (str): The regular expression pattern with capture groups.
-        group_names (list, optional): Names for the captured groups.
-
-    Returns:
-        bool: True if processing and saving was successful, False otherwise.
-    """
-    if not os.path.exists(input_filepath):
-        _log_error(f"Input file not found: {input_filepath}")
-        return False
-
-    file_content = ""
-    try:
-        with open(input_filepath, "r", encoding="utf-8") as f:
-            file_content = f.read()
-    except IOError as e:
-        _log_error(f"Error reading input file: {input_filepath}", e)
-        return False
-    except Exception as e:
-        _log_error(f"An unexpected error occurred while reading file: {input_filepath}", e)
-        return False
-
-    parsed_data = parse_text_with_regex(file_content, regex_pattern, group_names)
-
-    if not parsed_data:
-        _log_error(f"No data parsed from '{input_filepath}' using pattern '{regex_pattern}'. This might be expected if no matches are found.")
-        # We still return True if no data found but no error occurred. The user gets an empty list.
-        # However, for a file processing, it's often an error condition if no data is found at all.
-        # Let's consider it an error for file processing as it implies the regex might be wrong or file empty.
-        return False
+        _log_message("error", "An unexpected error occurred during CSV reading", str(e))
+        return None
 
     try:
-        with open(output_filepath, "w", encoding="utf-8") as f:
-            json.dump(parsed_data, f, indent=4)
-        print(f"Successfully processed '{input_filepath}' and saved structured data to '{output_filepath}'")
-        return True
-    except IOError as e:
-        _log_error(f"Error writing output JSON file: {output_filepath}", e)
-        return False
-    except TypeError as e:
-        _log_error(f"Error during JSON serialization. Check data structure validity.", e)
-        return False
+        json_output_string = json.dumps(json_data, indent=4)
     except Exception as e:
-        _log_error(f"An unexpected error occurred while writing JSON file: {output_filepath}", e)
-        return False
+        _log_message("error", "Failed to convert data to JSON string", str(e))
+        return None
 
-# --- Self-Test / Main Execution Logic ---
+    if output_file_path:
+        try:
+            with open(output_file_path, 'w', encoding='utf-8') as jsonfile:
+                jsonfile.write(json_output_string)
+            _log_message("info", f"Successfully converted and saved JSON to '{output_file_path}'")
+            return None # Return None as data is saved to file
+        except Exception as e:
+            _log_message("error", f"Failed to write JSON to file '{output_file_path}'", str(e))
+            return None
+    else:
+        _log_message("info", "Successfully converted CSV to JSON string (not saved to file).")
+        return json_output_string
+
+def run_self_test():
+    """
+    Executes a self-test with mock data to verify the utility's functionality.
+    """
+    _log_message("info", "--- Running self-test with mock data ---")
+
+    mock_csv_data_basic = """name,age,city
+Alice,30,New York
+Bob,24,Los Angeles
+Charlie,35,Chicago
+"""
+    mock_csv_data_semicolon = """product;price;category
+Laptop;1200.00;Electronics
+Mouse;25.50;Electronics
+Desk;150.00;Furniture
+"""
+    
+    temp_csv_file_basic = "temp_test_input_basic.csv"
+    temp_json_file_basic = "temp_test_output_basic.json"
+    temp_csv_file_semicolon = "temp_test_input_semicolon.csv"
+    temp_json_file_semicolon = "temp_test_output_semicolon.json"
+
+    test_passed = True
+
+    # Test 1: Basic CSV to JSON file output
+    _log_message("info", f"Test 1: Basic CSV (comma delimited) to JSON file ('{temp_json_file_basic}')")
+    try:
+        with open(temp_csv_file_basic, 'w', encoding='utf-8') as f:
+            f.write(mock_csv_data_basic)
+        
+        result = csv_to_json(temp_csv_file_basic, 'path', temp_json_file_basic)
+        
+        if result is None and os.path.exists(temp_json_file_basic):
+            with open(temp_json_file_basic, 'r', encoding='utf-8') as f:
+                json_content = json.load(f)
+            
+            expected_json = [
+                {"name": "Alice", "age": "30", "city": "New York"},
+                {"name": "Bob", "age": "24", "city": "Los Angeles"},
+                {"name": "Charlie", "age": "35", "city": "Chicago"}
+            ]
+            
+            if json_content == expected_json:
+                _log_message("info", "Test 1 Passed: JSON content matches expected.")
+            else:
+                _log_message("error", "Test 1 Failed: JSON content mismatch.")
+                test_passed = False
+        else:
+            _log_message("error", "Test 1 Failed: JSON file not created or unexpected return value.")
+            test_passed = False
+    except Exception as e:
+        _log_message("error", f"Test 1 encountered an exception: {e}")
+        test_passed = False
+    finally:
+        if os.path.exists(temp_csv_file_basic): os.remove(temp_csv_file_basic)
+        if os.path.exists(temp_json_file_basic): os.remove(temp_json_file_basic)
+
+    # Test 2: Semicolon delimited CSV to JSON file output
+    _log_message("info", f"Test 2: Semicolon delimited CSV to JSON file ('{temp_json_file_semicolon}')")
+    try:
+        with open(temp_csv_file_semicolon, 'w', encoding='utf-8') as f:
+            f.write(mock_csv_data_semicolon)
+        
+        result = csv_to_json(temp_csv_file_semicolon, 'path', temp_json_file_semicolon, delimiter=';')
+        
+        if result is None and os.path.exists(temp_json_file_semicolon):
+            with open(temp_json_file_semicolon, 'r', encoding='utf-8') as f:
+                json_content = json.load(f)
+            
+            expected_json = [
+                {"product": "Laptop", "price": "1200.00", "category": "Electronics"},
+                {"product": "Mouse", "price": "25.50", "category": "Electronics"},
+                {"product": "Desk", "price": "150.00", "category": "Furniture"}
+            ]
+            
+            if json_content == expected_json:
+                _log_message("info", "Test 2 Passed: JSON content matches expected.")
+            else:
+                _log_message("error", "Test 2 Failed: JSON content mismatch.")
+                test_passed = False
+        else:
+            _log_message("error", "Test 2 Failed: JSON file not created or unexpected return value.")
+            test_passed = False
+    except Exception as e:
+        _log_message("error", f"Test 2 encountered an exception: {e}")
+        test_passed = False
+    finally:
+        if os.path.exists(temp_csv_file_semicolon): os.remove(temp_csv_file_semicolon)
+        if os.path.exists(temp_json_file_semicolon): os.remove(temp_json_file_semicolon)
+
+    # Test 3: CSV string to JSON string output
+    _log_message("info", "Test 3: CSV string to JSON string (no file output).")
+    try:
+        csv_string = "header1,header2\nvalue1,value2\nvalue3,value4"
+        json_result_string = csv_to_json(csv_string, 'string')
+        
+        expected_json = [
+            {"header1": "value1", "header2": "value2"},
+            {"header1": "value3", "header2": "value4"}
+        ]
+        
+        if json_result_string:
+            parsed_json = json.loads(json_result_string)
+            if parsed_json == expected_json:
+                _log_message("info", "Test 3 Passed: JSON string content matches expected.")
+            else:
+                _log_message("error", "Test 3 Failed: JSON string content mismatch.")
+                test_passed = False
+        else:
+            _log_message("error", "Test 3 Failed: No JSON string returned.")
+            test_passed = False
+    except Exception as e:
+        _log_message("error", f"Test 3 encountered an exception: {e}")
+        test_passed = False
+
+    # Test 4: Error handling - Non-existent file
+    _log_message("info", "Test 4: Error handling - Non-existent input CSV file.")
+    try:
+        non_existent_file = "non_existent.csv"
+        result = csv_to_json(non_existent_file, 'path', "output_non_existent.json")
+        if result is None:
+            _log_message("info", "Test 4 Passed: Correctly handled non-existent file.")
+            if os.path.exists("output_non_existent.json"): os.remove("output_non_existent.json")
+        else:
+            _log_message("error", "Test 4 Failed: Did not correctly handle non-existent file.")
+            test_passed = False
+    except Exception as e:
+        _log_message("error", f"Test 4 encountered an unexpected exception: {e}")
+        test_passed = False
+
+    _log_message("info", "--- Self-test complete ---")
+    if test_passed:
+        _log_message("info", "All self-tests passed successfully!")
+    else:
+        _log_message("error", "One or more self-tests failed.")
+        sys.exit(1) # Indicate failure
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        # User provided arguments, assume they want to process files.
-        # Expected arguments:
-        # sys.argv[1] -> input file path
-        # sys.argv[2] -> output JSON file path (optional, defaults to DEFAULT_OUTPUT_FILE)
-        # sys.argv[3] -> regex pattern (optional, defaults to DEFAULT_REGEX_PATTERN)
-        # sys.argv[4:] -> group names (optional, comma-separated string, e.g., "timestamp,level,message")
-
-        input_file = sys.argv[1]
-        output_file = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_OUTPUT_FILE
-        regex = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_REGEX_PATTERN
-        
-        group_names = DEFAULT_GROUP_NAMES
-        if len(sys.argv) > 4:
-            # If group names are provided as a single comma-separated string
-            group_names = sys.argv[4].split(',')
-            group_names = [name.strip() for name in group_names if name.strip()]
-        
-        print(f"--- Running in File Processing Mode ---")
-        print(f"  Input File: {input_file}")
-        print(f"  Output JSON: {output_file}")
-        print(f"  Regex Pattern: '{regex}'")
-        print(f"  Group Names: {group_names}")
-
-        if not process_file_to_json(input_file, output_file, regex, group_names):
-            print(f"File processing failed or produced no output. Check 'log_parser_errors.log' for details.")
-        print(f"--- File Processing Complete ---")
-
+    if len(sys.argv) == 1:
+        # No arguments provided, run self-test
+        run_self_test()
     else:
-        # No arguments provided, execute self-test mode.
-        print("--- Running Self-Test: Unstructured Text to JSON Parser Utility ---")
-        print("This test demonstrates parsing sample log-like data and outputting it as structured JSON.")
+        # Command-line arguments provided
+        _log_message("info", "--- Running utility with command-line arguments ---")
+        
+        input_csv_path = None
+        output_json_path = None
+        delimiter = ','
 
-        # Sample log data simulating server logs or application events
-        sample_log_data = """
-[2023-10-27 10:01:05] INFO: Request received from user:12345 for /api/data
-[2023-10-27 10:01:10] DEBUG: Processing item_id:ABC-001 in module 'core'
-[2023-10-27 10:01:12] ERROR: Failed to connect to DB for user:12345. Retrying...
-[2023-10-27 10:01:15] INFO: Response sent to user:12345 (200 OK)
-[2023-10-27 10:02:01] WARNING: High CPU usage detected on host:server-01. Threshold: 85%
-This line does not match the pattern and should be ignored.
-[2023-10-27 10:02:05] INFO: Service restart initiated.
-"""
-        # Define a specific regex pattern for the sample log data
-        # This pattern specifically captures: full Timestamp, Log Level, and the rest as Message.
-        test_regex_pattern = r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] (\w+): (.*)$"
-        test_group_names = ["timestamp", "level", "message"] # Names for the captured groups
+        # Basic argument parsing
+        i = 1
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if arg == "-i" or arg == "--input":
+                if i + 1 < len(sys.argv):
+                    input_csv_path = sys.argv[i+1]
+                    i += 1
+                else:
+                    _log_message("error", "Error: --input requires a file path.")
+                    _log_message("info", "Usage: python csv_to_json_utility.py -i <input_csv_file> -o <output_json_file> [-d <delimiter>]")
+                    sys.exit(1)
+            elif arg == "-o" or arg == "--output":
+                if i + 1 < len(sys.argv):
+                    output_json_path = sys.argv[i+1]
+                    i += 1
+                else:
+                    _log_message("error", "Error: --output requires a file path.")
+                    _log_message("info", "Usage: python csv_to_json_utility.py -i <input_csv_file> -o <output_json_file> [-d <delimiter>]")
+                    sys.exit(1)
+            elif arg == "-d" or arg == "--delimiter":
+                if i + 1 < len(sys.argv):
+                    delimiter = sys.argv[i+1]
+                    if len(delimiter) != 1:
+                        _log_message("error", "Error: --delimiter must be a single character.")
+                        _log_message("info", "Usage: python csv_to_json_utility.py -i <input_csv_file> -o <output_json_file> [-d <delimiter>]")
+                        sys.exit(1)
+                    i += 1
+                else:
+                    _log_message("error", "Error: --delimiter requires a character.")
+                    _log_message("info", "Usage: python csv_to_json_utility.py -i <input_csv_file> -o <output_json_file> [-d <delimiter>]")
+                    sys.exit(1)
+            else:
+                _log_message("error", f"Unknown argument: {arg}")
+                _log_message("info", "Usage: python csv_to_json_utility.py -i <input_csv_file> -o <output_json_file> [-d <delimiter>]")
+                sys.exit(1)
+            i += 1
 
-        print(f"\n--- Sample Input Text Data ---\n{sample_log_data.strip()}")
-        print(f"\n--- Using Regex Pattern ---\n'{test_regex_pattern}'")
-        print(f"\n--- With Group Names ---\n{test_group_names}")
+        if not input_csv_path:
+            _log_message("error", "Error: Input CSV file (--input) is required.")
+            _log_message("info", "Usage: python csv_to_json_utility.py -i <input_csv_file> -o <output_json_file> [-d <delimiter>]")
+            sys.exit(1)
 
-        # Perform the parsing
-        parsed_results = parse_text_with_regex(sample_log_data, test_regex_pattern, test_group_names)
-
-        print("\n--- Self-Test Results (JSON Output to stdout) ---")
-        if parsed_results:
-            # Print to stdout in a pretty JSON format
-            print(json.dumps(parsed_results, indent=4))
-
-            # Optionally, save self-test output to a temporary file
-            temp_output_file = "self_test_output.json"
-            try:
-                with open(temp_output_file, "w", encoding="utf-8") as f:
-                    json.dump(parsed_results, f, indent=4)
-                print(f"\nSelf-test output also saved to '{temp_output_file}' for review.")
-            except Exception as e:
-                _log_error(f"Failed to save self-test output to '{temp_output_file}'", e)
-        else:
-            _log_error("Self-test failed to parse any data. Check the sample data and regex pattern.")
-
-        print("\n--- Self-Test Complete ---")
+        # Execute the conversion
+        _log_message("info", f"Attempting to convert '{input_csv_path}' (delimiter: '{delimiter}') to JSON...")
+        csv_to_json(input_csv_path, 'path', output_json_path, delimiter)
+        _log_message("info", "--- Utility execution complete ---")
